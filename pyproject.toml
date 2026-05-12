@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "streaming-etl-pipeline"
+version = "0.1.0"
+description = "Event-time streaming ETL into DuckDB with watermarks, late-data side outputs, and crash-safe backfill."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Tajaddin Gafarov", email = "gafarovtajaddin@gmail.com"}]
+keywords = ["streaming", "etl", "duckdb", "kafka", "watermark", "late-data", "data-engineering"]
+dependencies = [
+    "duckdb>=0.10",
+    "pydantic>=2.6",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+kafka = ["confluent-kafka>=2.4"]
+dev = ["pytest>=8.0", "hypothesis>=6.100"]
+
+[project.scripts]
+streaming-etl = "streaming_etl.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]

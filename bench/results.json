@@ -1,0 +1,23 @@
+{
+  "config": {
+    "n": 50000,
+    "keys": 50,
+    "window_ms": 1000,
+    "lateness_ms": 200,
+    "late_frac": 0.05,
+    "partitions": 4,
+    "batch_size": 2000
+  },
+  "events_produced": 50000,
+  "late_events_injected": 2564,
+  "events_consumed": 50000,
+  "windows_emitted": 2550,
+  "late_events_observed": 1199,
+  "late_recovery_rate": 0.4676,
+  "produce_seconds": 0.215,
+  "consume_seconds": 10.95,
+  "throughput_events_per_sec": 4566,
+  "final_watermark_lag_ms": 205,
+  "allowed_lateness_ms": 200,
+  "db_size_kb": 1036.0
+}
