@@ -98,7 +98,7 @@ class Pipeline:
         if self.checkpointer:
             if self.stats.last_offsets:
                 self.checkpointer.save_offsets(self.stats.last_offsets)
-            self.checkpointer.save_watermark(self.stats.last_watermark_ms)
+            self.checkpointer.save_watermark(self.aggregator.watermark.watermark_ms)
 
     def step(self) -> int:
         """Pull one batch, process it, return events consumed."""

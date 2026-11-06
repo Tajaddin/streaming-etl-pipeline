@@ -146,3 +146,24 @@ def test_run_for_respects_timeout(tmp_path):
         pipe.run_for(0.1)
         elapsed = time.time() - t0
         assert 0.1 <= elapsed < 0.5, f"unexpected run time {elapsed}s"
+
+
+def test_restart_with_nothing_to_consume_keeps_watermark_floor(tmp_path):
+    bus = InMemoryBus()
+    db = tmp_path / "p.duckdb"
+    ck_path = tmp_path / "ck.sqlite"
+    _publish(bus, [("a", 100, 1), ("a", 1500, 9)])
+    for _ in range(2):  # the second run finds the bus empty
+        ck = Checkpointer(ck_path)
+        with DuckDBSink(db) as sink:
+            agg = TumblingAggregator(window_size_ms=1000, value_field="v", allowed_lateness_ms=0)
+            Pipeline(bus, agg, sink, checkpointer=ck).run_until_drained()
+        ck.close()
+
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        agg = TumblingAggregator(window_size_ms=1000, value_field="v", allowed_lateness_ms=0)
+        _publish(bus, [("a", 50, 1)])  # window [0,1000) closed in the first run
+        stats = Pipeline(bus, agg, sink, checkpointer=ck).run_until_drained()
+        assert stats.late_events == 1
+    ck.close()
