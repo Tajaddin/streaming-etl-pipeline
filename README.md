@@ -2,7 +2,7 @@
 
 > Event-time tumbling-window ETL into DuckDB with **per-partition watermarks**, late-data side outputs, and crash-safe SQLite checkpointing. 50K events / 4 partitions / 50 keys benchmark: **4,566 ev/s end-to-end** (DuckDB sink included), **2,550 windows emitted**, **0 false-late events** (vs 71% false-late rate with the naive single-watermark implementation this repo used to ship).
 
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![Tests](https://img.shields.io/badge/tests-25%20passing-brightgreen)](#tests) [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![Tests](https://img.shields.io/badge/tests-35%20passing-brightgreen)](#tests) [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 
 ## Why this exists
 
@@ -12,7 +12,7 @@ Most "Kafka tutorials" stop at `consumer.poll()` + a print loop. Real ETL needs:
 2. **Bounded out-of-orderness** via watermarks, so windows can close.
 3. **Late-data side outputs**, so events that miss their window aren't silently dropped.
 4. **Per-partition watermarks**, so a slow partition holds back the global clock instead of getting its events flagged as late.
-5. **Crash-safe resume**, so a restart doesn't double-emit closed windows.
+5. **Crash-safe resume**, so a restart neither loses the windows that were still open nor double-emits closed ones.
 6. **A real sink**, not just print — here DuckDB with upsert semantics.
 
 This repo ships all six in <500 lines, with a benchmark that surfaces the trade-offs.
@@ -31,8 +31,8 @@ events ──►    │  (InMemoryBus +      │ ──►     │  per-partitio
                        │                                  │
                        ▼                                  ▼
               ┌──────────────────────────────────────────────┐
-              │  Checkpointer  (SQLite, WAL)                 │
-              │   offsets per partition + watermark floor    │
+              │  Checkpointer  (SQLite, one txn per commit)  │
+              │   offsets + watermarks + open windows        │
               └──────────────────────────────────────────────┘
 ```
 
@@ -143,15 +143,16 @@ pytest -v
 test_bus.py        6 passed     bus produce/consume/commit/round-robin/blocking
 test_watermark.py  9 passed     watermark + tumbling aggregator + late side output
 test_sink.py       3 passed     DuckDB upsert + late table + payload JSON
-test_pipeline.py   7 passed     end-to-end + checkpoint roundtrip + crash-resume no double-emit + idempotent replay
+test_pipeline.py  17 passed     end-to-end + checkpoint roundtrip + crash-resume (no loss, no double-emit) + idempotent replay
 ─────────────────────────────────
-25 passed in 3.19s
+35 passed in 8.10s
 ```
 
-The two tests that matter most for confidence:
+The tests that matter most for confidence:
 
 * `test_late_event_goes_to_side_output` — a stale event for a closed window must land in `late_events`, never in `windows`.
 * `test_restart_does_not_double_emit_old_windows` — after a checkpoint, restarting the pipeline with a fresh aggregator must not re-aggregate old windows. The watermark floor mechanism guards this.
+* `test_restart_after_crash_matches_uninterrupted_run` — kill the pipeline after each batch in turn, restart it from the checkpoint against a Kafka-style bus that redelivers everything after the last commit, and the `windows` table must match a run that never crashed. Offsets are committed to the bus only after the open windows they fed are in the checkpoint, and redelivered offsets the checkpoint already covers are skipped.
 
 ## Project layout
 
@@ -162,10 +163,10 @@ The two tests that matter most for confidence:
 │   ├── bus.py           # MessageBus protocol + InMemoryBus (round-robin) + KafkaBus adapter
 │   ├── watermark.py     # WatermarkTracker (per-partition) + TumblingAggregator + LateEvent
 │   ├── sink.py          # DuckDBSink (transactional windows + late_events)
-│   ├── checkpoint.py    # SQLite-backed offsets + watermark floor
+│   ├── checkpoint.py    # SQLite-backed offsets, watermarks, open windows
 │   ├── pipeline.py      # Orchestrator: consume → aggregate → sink + commit
 │   └── cli.py           # `streaming-etl demo`
-├── tests/               # 25 tests across 4 files
+├── tests/               # 35 tests across 4 files
 └── bench/run_benchmark.py
 ```
 
@@ -173,7 +174,7 @@ The two tests that matter most for confidence:
 
 **Single-process only.** No multi-consumer coordination. A real deployment uses Kafka's consumer-group rebalance; here, one `Pipeline` instance owns the whole topic.
 
-**No exactly-once.** Sink writes are idempotent (PK upsert on `windows`, no PK on `late_events`), but a crash between sink write and offset commit can re-process a batch. With the upsert, that's a no-op for `windows` but produces duplicate rows in `late_events`. Adding a `request_id` PK to `late_events` would close that gap.
+**No exactly-once.** Sink writes are idempotent (PK upsert on `windows`, no PK on `late_events`), but a crash after a sink write and before the next checkpoint re-processes the events since that checkpoint. With the upsert, that's a no-op for `windows` but produces duplicate rows in `late_events`. Adding a `request_id` PK to `late_events` would close that gap.
 
 **Single tumbling-window aggregator.** No sliding windows, no session windows, no multi-aggregator graphs. The state machine is intentionally small.
 

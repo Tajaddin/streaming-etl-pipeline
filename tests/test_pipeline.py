@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from streaming_etl import (
     Checkpointer,
     DuckDBSink,
@@ -167,3 +169,152 @@ def test_restart_with_nothing_to_consume_keeps_watermark_floor(tmp_path):
         stats = Pipeline(bus, agg, sink, checkpointer=ck).run_until_drained()
         assert stats.late_events == 1
     ck.close()
+
+
+class _LogBus:
+    """Kafka-like bus: records stay in the log, and a restarted consumer
+    resumes after the last committed offset of each partition."""
+
+    def __init__(self, num_partitions: int = 1) -> None:
+        self._log: dict[int, list[Event]] = {p: [] for p in range(num_partitions)}
+        self._pos = {p: 0 for p in range(num_partitions)}
+        self.committed = {p: -1 for p in range(num_partitions)}
+
+    def produce(self, event: Event) -> None:
+        q = self._log[event.partition]
+        event.offset = len(q)
+        q.append(event)
+
+    def consume(self, batch_size: int = 100, timeout_ms: int = 0) -> list[Event]:
+        out: list[Event] = []
+        while len(out) < batch_size:
+            pulled = 0
+            for p, q in self._log.items():
+                if self._pos[p] < len(q) and len(out) < batch_size:
+                    out.append(q[self._pos[p]])
+                    self._pos[p] += 1
+                    pulled += 1
+            if pulled == 0:
+                break
+        return out
+
+    def commit(self, offsets: dict[int, int]) -> None:
+        for p, off in offsets.items():
+            self.committed[p] = max(self.committed[p], off)
+
+    def restart_consumer(self) -> None:
+        self._pos = {p: off + 1 for p, off in self.committed.items()}
+
+
+# (key, partition, event_time_ms, value). Out of order within each partition,
+# one event per partition lands in an already-closed window.
+_STREAM = [
+    ("a", 0, 100, 1),
+    ("b", 1, 150, 2),
+    ("a", 0, 900, 3),
+    ("b", 1, 400, 4),
+    ("a", 0, 1300, 5),
+    ("b", 1, 1100, 6),
+    ("a", 0, 1250, 7),
+    ("b", 1, 2400, 8),
+    ("a", 0, 2600, 9),
+    ("b", 1, 300, 10),
+    ("a", 0, 3700, 11),
+    ("b", 1, 3500, 12),
+    ("a", 0, 2900, 13),
+    ("b", 1, 4800, 14),
+]
+
+
+def _log_bus_with_stream() -> _LogBus:
+    bus = _LogBus(num_partitions=2)
+    for k, p, ts, v in _STREAM:
+        bus.produce(Event(key=k, event_time_ms=ts, payload={"v": v}, partition=p))
+    return bus
+
+
+def _agg() -> TumblingAggregator:
+    return TumblingAggregator(window_size_ms=1000, value_field="v", allowed_lateness_ms=200)
+
+
+def _uninterrupted(tmp_path: Path) -> tuple[list[tuple], set[tuple]]:
+    with DuckDBSink(tmp_path / "ref.duckdb") as sink:
+        Pipeline(_log_bus_with_stream(), _agg(), sink, batch_size=2).run_until_drained()
+        return sink.fetch_windows(), set(sink.fetch_late())
+
+
+def test_crash_before_drain_does_not_lose_open_windows(tmp_path):
+    expected_windows, _ = _uninterrupted(tmp_path)
+    bus = _log_bus_with_stream()
+    db = tmp_path / "p.duckdb"
+    ck_path = tmp_path / "ck.sqlite"
+
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        pipe = Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=2, commit_every_batches=1)
+        pipe.step()  # offsets 0 of both partitions are committed; their windows are still open
+    ck.close()  # crash: the in-memory windows are gone
+
+    bus.restart_consumer()
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=2).run_until_drained()
+        assert sink.fetch_windows() == expected_windows
+    ck.close()
+
+
+@pytest.mark.parametrize("crash_after_batches", range(1, 8))
+def test_restart_after_crash_matches_uninterrupted_run(tmp_path, crash_after_batches):
+    expected_windows, expected_late = _uninterrupted(tmp_path)
+    bus = _log_bus_with_stream()
+    db = tmp_path / "p.duckdb"
+    ck_path = tmp_path / "ck.sqlite"
+
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        # commit_every_batches=2 leaves batches processed but not checkpointed.
+        pipe = Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=2, commit_every_batches=2)
+        for _ in range(crash_after_batches):
+            pipe.step()
+    ck.close()
+
+    bus.restart_consumer()
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=2).run_until_drained()
+        assert sink.fetch_windows() == expected_windows
+        assert set(sink.fetch_late()) == expected_late
+    ck.close()
+
+
+def test_redelivered_events_already_checkpointed_are_skipped(tmp_path):
+    class CommitFailsOnce(_LogBus):
+        failed = False
+
+        def commit(self, offsets):
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("broker unavailable")
+            super().commit(offsets)
+
+    expected_windows, _ = _uninterrupted(tmp_path)
+    bus = CommitFailsOnce(num_partitions=2)
+    for k, p, ts, v in _STREAM:
+        bus.produce(Event(key=k, event_time_ms=ts, payload={"v": v}, partition=p))
+    db = tmp_path / "p.duckdb"
+    ck_path = tmp_path / "ck.sqlite"
+
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        pipe = Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=4, commit_every_batches=1)
+        with pytest.raises(RuntimeError):
+            pipe.step()  # checkpoint written, broker commit lost
+    ck.close()
+
+    bus.restart_consumer()  # redelivers offsets the checkpoint already holds
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=4).run_until_drained()
+        assert sink.fetch_windows() == expected_windows
+    ck.close()
+
