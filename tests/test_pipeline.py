@@ -306,6 +306,8 @@ def test_restart_after_crash_matches_uninterrupted_run(tmp_path, crash_after_bat
     with DuckDBSink(db) as sink:
         Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=2).run_until_drained()
         assert sink.fetch_windows() == expected_windows
+        # late_events has no key, so the replay after a crash between checkpoints
+        # re-inserts late rows (see README, Limitations); set() ignores those.
         assert set(sink.fetch_late()) == expected_late
     ck.close()
 
