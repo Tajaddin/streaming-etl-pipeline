@@ -337,8 +337,10 @@ def test_redelivered_events_already_checkpointed_are_skipped(tmp_path):
     bus.restart_consumer()  # redelivers offsets the checkpoint already holds
     ck = Checkpointer(ck_path)
     with DuckDBSink(db) as sink:
-        Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=4).run_until_drained()
+        stats = Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=4).run_until_drained()
         assert sink.fetch_windows() == expected_windows
+    assert stats.redelivered_skipped == 4
+    assert stats.events_consumed == len(_STREAM)
     ck.close()
 
 

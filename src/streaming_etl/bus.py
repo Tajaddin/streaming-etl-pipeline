@@ -11,6 +11,11 @@ The contract is intentionally minimal:
   blocking up to ``timeout_ms`` for the first arrival.
 * ``commit(offsets)`` durably stores per-partition offsets the consumer is
   done with — the bus may garbage-collect records up to that point.
+
+Every consumed event must carry its ``partition`` and an ``offset`` that
+increases within that partition (``Event.offset`` defaults to 0). The
+pipeline treats an offset at or below one it has already processed as a
+redelivery and skips it, counting it in ``PipelineStats.redelivered_skipped``.
 """
 
 from __future__ import annotations

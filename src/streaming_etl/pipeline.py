@@ -34,6 +34,7 @@ from streaming_etl.watermark import TumblingAggregator
 @dataclass
 class PipelineStats:
     events_consumed: int = 0
+    redelivered_skipped: int = 0
     windows_emitted: int = 0
     late_events: int = 0
     batches: int = 0
@@ -88,7 +89,8 @@ class Pipeline:
         late_buf = []
         for evt in batch:
             if evt.offset <= self.stats.last_offsets.get(evt.partition, -1):
-                # Redelivered after a restart: already part of the checkpoint.
+                # Redelivered: already part of the in-memory state or the checkpoint.
+                self.stats.redelivered_skipped += 1
                 continue
             self.stats.last_offsets[evt.partition] = evt.offset
             late = self.aggregator.add(evt)
