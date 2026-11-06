@@ -37,9 +37,9 @@ CREATE TABLE IF NOT EXISTS open_windows (
     key             TEXT    NOT NULL,
     window_start_ms INTEGER NOT NULL,
     count           INTEGER NOT NULL,
-    sum_value       REAL    NOT NULL,
-    min_value       REAL    NOT NULL,
-    max_value       REAL    NOT NULL,
+    sum_value       REAL,
+    min_value       REAL,
+    max_value       REAL,
     PRIMARY KEY (key, window_start_ms)
 );
 """
@@ -122,7 +122,12 @@ class Checkpointer:
         return {p: (max_t, wm) for p, max_t, wm in rows}
 
     def load_open_windows(self) -> list[OpenWindow]:
-        return self._conn.execute(
+        rows = self._conn.execute(
             "SELECT key, window_start_ms, count, sum_value, min_value, max_value "
             "FROM open_windows"
         ).fetchall()
+        # SQLite stores a NaN REAL as NULL; NULL is never written otherwise.
+        return [
+            (key, start, count, *(float("nan") if v is None else v for v in values))
+            for key, start, count, *values in rows
+        ]

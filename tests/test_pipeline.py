@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -318,3 +319,26 @@ def test_redelivered_events_already_checkpointed_are_skipped(tmp_path):
         assert sink.fetch_windows() == expected_windows
     ck.close()
 
+
+
+def test_nan_value_in_open_window_survives_checkpoint_and_restart(tmp_path):
+    bus = _LogBus()
+    bus.produce(Event(key="a", event_time_ms=100, payload={"v": float("nan")}))
+    bus.produce(Event(key="a", event_time_ms=200, payload={"v": 1.0}))
+    db = tmp_path / "p.duckdb"
+    ck_path = tmp_path / "ck.sqlite"
+
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        pipe = Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=1, commit_every_batches=1)
+        pipe.step()  # the NaN is checkpointed while its window is still open
+    ck.close()
+
+    bus.restart_consumer()
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        Pipeline(bus, _agg(), sink, checkpointer=ck, batch_size=1).run_until_drained()
+        [(start, _end, key, count, total, lo, hi)] = sink.fetch_windows()
+    ck.close()
+    assert (start, key, count, lo, hi) == (0, "a", 2, 1.0, 1.0)
+    assert math.isnan(total)
