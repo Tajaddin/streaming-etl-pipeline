@@ -172,6 +172,28 @@ def test_restart_with_nothing_to_consume_keeps_watermark_floor(tmp_path):
     ck.close()
 
 
+def test_restart_after_drain_keeps_windows_closed_by_final_flush(tmp_path):
+    bus = InMemoryBus()
+    db = tmp_path / "p.duckdb"
+    ck_path = tmp_path / "ck.sqlite"
+    _publish(bus, [("a", 100, 1), ("a", 200, 2)])
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        agg = TumblingAggregator(window_size_ms=1000, value_field="v", allowed_lateness_ms=0)
+        # The watermark stays at 200, so only the end-of-stream flush closes [0,1000).
+        Pipeline(bus, agg, sink, checkpointer=ck).run_until_drained()
+    ck.close()
+
+    ck = Checkpointer(ck_path)
+    with DuckDBSink(db) as sink:
+        agg = TumblingAggregator(window_size_ms=1000, value_field="v", allowed_lateness_ms=0)
+        _publish(bus, [("a", 300, 4)])
+        stats = Pipeline(bus, agg, sink, checkpointer=ck).run_until_drained()
+        assert stats.late_events == 1
+        assert sink.fetch_windows() == [(0, 1000, "a", 2, 3.0, 1.0, 2.0)]
+    ck.close()
+
+
 class _LogBus:
     """Kafka-like bus: records stay in the log, and a restarted consumer
     resumes after the last committed offset of each partition."""

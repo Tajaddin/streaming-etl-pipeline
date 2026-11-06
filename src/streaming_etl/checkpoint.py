@@ -1,13 +1,15 @@
 """Crash-safe checkpointing.
 
 The pipeline periodically persists, in one SQLite transaction, (a) the last
-processed offset per partition, (b) the watermarks, and (c) every window that
-is still open. Offsets are committed to the bus only after that transaction,
-so the bus never skips past an event whose effect exists only in memory.
+processed offset per partition, (b) the watermarks, (c) every window that is
+still open, and (d) every closed window the watermark does not cover yet
+(the end-of-stream flush closes windows ahead of it). Offsets are committed
+to the bus only after that transaction, so the bus never skips past an event
+whose effect exists only in memory.
 
-On restart the pipeline restores the watermarks and open windows, and drops
-any redelivered event at or below the checkpointed offset: its effect is
-already in the restored state or in the sink.
+On restart the pipeline restores the watermarks and the open and closed
+windows, and drops any redelivered event at or below the checkpointed offset:
+its effect is already in the restored state or in the sink.
 
 We use SQLite (stdlib only) — DuckDB is the analytics sink; a separate
 stateful KV is the right tool for "small, frequent, durable writes."
@@ -42,6 +44,11 @@ CREATE TABLE IF NOT EXISTS open_windows (
     max_value       REAL,
     PRIMARY KEY (key, window_start_ms)
 );
+CREATE TABLE IF NOT EXISTS closed_windows (
+    key             TEXT    NOT NULL,
+    window_start_ms INTEGER NOT NULL,
+    PRIMARY KEY (key, window_start_ms)
+);
 """
 
 _UPSERT_OFFSET = (
@@ -73,6 +80,7 @@ class Checkpointer:
         watermark_ms: int,
         partition_watermarks: dict[int, tuple[int, int]],
         open_windows: list[OpenWindow],
+        closed_windows: list[tuple[str, int]],
     ) -> None:
         """Replace the whole checkpoint atomically."""
         conn = self._conn
@@ -91,6 +99,8 @@ class Checkpointer:
             conn.executemany(
                 "INSERT INTO open_windows VALUES (?, ?, ?, ?, ?, ?)", open_windows
             )
+            conn.execute("DELETE FROM closed_windows")
+            conn.executemany("INSERT INTO closed_windows VALUES (?, ?)", closed_windows)
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")
@@ -131,3 +141,8 @@ class Checkpointer:
             (key, start, count, *(float("nan") if v is None else v for v in values))
             for key, start, count, *values in rows
         ]
+
+    def load_closed_windows(self) -> list[tuple[str, int]]:
+        return self._conn.execute(
+            "SELECT key, window_start_ms FROM closed_windows"
+        ).fetchall()

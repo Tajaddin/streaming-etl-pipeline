@@ -6,8 +6,9 @@ A single ``Pipeline`` instance:
 2. Routes each event through a :class:`TumblingAggregator`.
 3. Drains finalised windows to a :class:`DuckDBSink`.
 4. Routes late events to the same sink's ``late_events`` table.
-5. Periodically checkpoints offsets, watermarks and open windows, then
-   commits the offsets to the bus.
+5. Periodically checkpoints offsets, watermarks, open windows and the
+   closed windows the watermark does not cover, then commits the offsets
+   to the bus.
 
 Crash safety needs a :class:`Checkpointer`. Without one, a crash loses
 the windows that were still open in memory.
@@ -80,6 +81,7 @@ class Pipeline:
                 checkpointer.load_partition_watermarks()
             )
             self.aggregator.restore_open_windows(checkpointer.load_open_windows())
+            self.aggregator.restore_closed_windows(checkpointer.load_closed_windows())
             self.stats.last_offsets = checkpointer.load_offsets()
 
     def _process_batch(self, batch: list[Event]) -> None:
@@ -114,6 +116,7 @@ class Pipeline:
                 watermark.watermark_ms,
                 watermark.partition_state(),
                 self.aggregator.open_windows(),
+                self.aggregator.closed_windows_above_watermark(),
             )
         if self.stats.last_offsets:
             self.bus.commit(self.stats.last_offsets)

@@ -211,6 +211,20 @@ class TumblingAggregator:
                 "max": hi,
             }
 
+    def closed_windows_above_watermark(self) -> list[tuple[str, int]]:
+        """``(key, window_start_ms)`` of closed windows the watermark does not
+        cover: those closed by :meth:`flush_all` ahead of it, or passed by a
+        watermark that a newly seen partition then pulled back."""
+        wm = self.watermark.watermark_ms
+        return [
+            (key, win_start)
+            for key, win_start in self._closed_windows
+            if win_start + self.window_size_ms > wm
+        ]
+
+    def restore_closed_windows(self, windows: list[tuple[str, int]]) -> None:
+        self._closed_windows.update(windows)
+
     def flush_ready(self) -> list[WindowOutput]:
         """Emit and clear windows whose right edge is below the watermark."""
         out: list[WindowOutput] = []
