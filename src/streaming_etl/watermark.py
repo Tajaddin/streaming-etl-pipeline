@@ -115,6 +115,19 @@ class WatermarkTracker:
                 )
                 self._dirty = True
 
+    def partition_state(self) -> dict[int, tuple[int, int]]:
+        """Per-partition ``(max_event_time_ms, watermark_ms)``, for checkpoints."""
+        return {
+            p: (self._max_per_partition[p], wm)
+            for p, wm in self._watermark_per_partition.items()
+        }
+
+    def restore_partitions(self, state: dict[int, tuple[int, int]]) -> None:
+        for p, (max_event_time_ms, watermark_ms) in state.items():
+            self._max_per_partition[p] = max_event_time_ms
+            self._watermark_per_partition[p] = watermark_ms
+        self._dirty = True
+
 
 _AggregatorState = dict[tuple[str, int], dict[str, float]]
 
@@ -179,6 +192,38 @@ class TumblingAggregator:
         if value > bucket["max"]:
             bucket["max"] = value
         return []
+
+    def open_windows(self) -> list[tuple[str, int, int, float, float, float]]:
+        """``(key, window_start_ms, count, sum, min, max)`` of every open window."""
+        return [
+            (key, win_start, int(b["count"]), b["sum"], b["min"], b["max"])
+            for (key, win_start), b in self._state.items()
+        ]
+
+    def restore_open_windows(
+        self, windows: list[tuple[str, int, int, float, float, float]]
+    ) -> None:
+        for key, win_start, count, total, lo, hi in windows:
+            self._state[(key, win_start)] = {
+                "count": float(count),
+                "sum": total,
+                "min": lo,
+                "max": hi,
+            }
+
+    def closed_windows_above_watermark(self) -> list[tuple[str, int]]:
+        """``(key, window_start_ms)`` of closed windows the watermark does not
+        cover: those closed by :meth:`flush_all` ahead of it, or passed by a
+        watermark that a newly seen partition then pulled back."""
+        wm = self.watermark.watermark_ms
+        return [
+            (key, win_start)
+            for key, win_start in self._closed_windows
+            if win_start + self.window_size_ms > wm
+        ]
+
+    def restore_closed_windows(self, windows: list[tuple[str, int]]) -> None:
+        self._closed_windows.update(windows)
 
     def flush_ready(self) -> list[WindowOutput]:
         """Emit and clear windows whose right edge is below the watermark."""

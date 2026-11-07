@@ -6,7 +6,12 @@ A single ``Pipeline`` instance:
 2. Routes each event through a :class:`TumblingAggregator`.
 3. Drains finalised windows to a :class:`DuckDBSink`.
 4. Routes late events to the same sink's ``late_events`` table.
-5. Periodically commits offsets to the bus and persists a checkpoint.
+5. Periodically checkpoints offsets, watermarks, open windows and the
+   closed windows the watermark does not cover, then commits the offsets
+   to the bus.
+
+Crash safety needs a :class:`Checkpointer`. Without one, a crash loses
+the windows that were still open in memory.
 
 The ``run_for`` loop is the workhorse; ``run_until_drained`` is the
 benchmark-friendly variant that exits when the bus reports an empty
@@ -29,6 +34,7 @@ from streaming_etl.watermark import TumblingAggregator
 @dataclass
 class PipelineStats:
     events_consumed: int = 0
+    redelivered_skipped: int = 0
     windows_emitted: int = 0
     late_events: int = 0
     batches: int = 0
@@ -66,21 +72,30 @@ class Pipeline:
         self.consume_timeout_ms = consume_timeout_ms
         self.stats = PipelineStats()
 
-        # On startup, restore watermark + offsets so we don't double-emit windows.
+        # On startup, restore the state as of the last checkpoint: closed
+        # windows stay closed, open windows keep what they had aggregated.
         if checkpointer:
             prior_wm = checkpointer.load_watermark()
             if prior_wm is not None:
                 self.aggregator.watermark.set_floor(prior_wm)
+            self.aggregator.watermark.restore_partitions(
+                checkpointer.load_partition_watermarks()
+            )
+            self.aggregator.restore_open_windows(checkpointer.load_open_windows())
+            self.aggregator.restore_closed_windows(checkpointer.load_closed_windows())
+            self.stats.last_offsets = checkpointer.load_offsets()
 
     def _process_batch(self, batch: list[Event]) -> None:
         late_buf = []
         for evt in batch:
+            if evt.offset <= self.stats.last_offsets.get(evt.partition, -1):
+                # Redelivered: already part of the in-memory state or the checkpoint.
+                self.stats.redelivered_skipped += 1
+                continue
+            self.stats.last_offsets[evt.partition] = evt.offset
             late = self.aggregator.add(evt)
             if late:
                 late_buf.extend(late)
-            off = self.stats.last_offsets.get(evt.partition, -1)
-            if evt.offset > off:
-                self.stats.last_offsets[evt.partition] = evt.offset
         # Now flush any windows that the latest watermark allows us to close.
         finished = self.aggregator.flush_ready()
         if finished:
@@ -93,12 +108,20 @@ class Pipeline:
         self.stats.last_watermark_ms = self.aggregator.watermark.watermark_ms
 
     def _commit(self) -> None:
+        # Checkpoint before committing: once the bus commit lands, those
+        # offsets are never redelivered, so the open windows they fed must
+        # already be durable.
+        if self.checkpointer:
+            watermark = self.aggregator.watermark
+            self.checkpointer.save_state(
+                self.stats.last_offsets,
+                watermark.watermark_ms,
+                watermark.partition_state(),
+                self.aggregator.open_windows(),
+                self.aggregator.closed_windows_above_watermark(),
+            )
         if self.stats.last_offsets:
             self.bus.commit(self.stats.last_offsets)
-        if self.checkpointer:
-            if self.stats.last_offsets:
-                self.checkpointer.save_offsets(self.stats.last_offsets)
-            self.checkpointer.save_watermark(self.stats.last_watermark_ms)
 
     def step(self) -> int:
         """Pull one batch, process it, return events consumed."""
